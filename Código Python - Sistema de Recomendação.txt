@@ -1,0 +1,364 @@
+    #BIBLIOTECAS UTILIZADAS
+    import pandas as pd
+    from datetime import datetime, timedelta
+    import yfinance as yf
+    from pandas.tseries.offsets import BDay
+    pd.set_option("display.max_colwidth", 150)
+    from datetime import date
+    import gspread
+    import time
+    from oauth2client.service_account import ServiceAccountCredentials
+    import smtplib
+    from email.mime.text import MIMEText
+
+
+
+    #FUNÇÕES PARA CONSULTAR URLS
+    def busca_informes_diarios_cvm_por_periodo(data_inicio, data_fim):
+      datas = pd.date_range(data_inicio, data_fim, freq='MS') 
+      informe_completo = pd.DataFrame()
+    
+      for data in datas:
+        try:
+          url ='http://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS/inf_diario_fi_{}{:02d}.csv'.format(data.year, data.month)
+          informe_mensal = pd.read_csv(url, sep=';')    
+        
+        except: 
+          print("Arquivo {} não encontrado!".format(url))    
+    
+        informe_completo = pd.concat([informe_completo, informe_mensal], ignore_index=True)
+    
+      return informe_completo
+  
+    def busca_cadastro_cvm(data=(date.today()-BDay(1))):
+      if data is not busca_cadastro_cvm.__defaults__[0]:
+        data = pd.to_datetime(data)
+      
+      try:
+        url = 'http://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv'
+         return pd.read_csv(url, sep=';', encoding='ISO-8859-1')
+    
+    def cdi_acumulado(data_inicio, data_fim):
+      codigo_bcb = 12
+      
+      url = 'http://api.bcb.gov.br/dados/serie/bcdata.sgs.{}/dados?formato=json'.format(codigo_bcb)
+      cdi = pd.read_json(url)
+      cdi['data'] = pd.to_datetime(cdi['data'], dayfirst=True)
+      cdi.set_index('data', inplace=True) 
+      
+      cdi_acumulado = (1 + cdi[data_inicio : data_fim] / 100).cumprod()
+      cdi_acumulado.iloc[0] = 1
+      return cdi_acumulado    
+  
+    # DEFINE FUNÇÕES 
+    def meses(valor):
+        if valor < 10:  ano_mes = format(data_atual.year)+'-0'+format(data_atual.month)#'agressivo'
+        else: ano_mes = format(data_atual.year)+'-'+format(data_atual.month)#'moderado'   
+        return ano_mes
+
+    
+    def ano(valor):
+        if valor-6 < 0:  ano_mes = str(format(data_atual.year)-1)+'-0'+str(format(data_atual.month)+7)
+        elif valor-6 == 0:  ano_mes = str(format(data_atual.year))+'-01'
+        else: ano_mes = str(format(data_atual.year))+'-'+str((format(data_atual.month)-6))
+        return ano_mes
+    corrige_ano = int(format(data_atual.month))
+
+        
+
+    
+
+        
+    def melhores_e_piores(informes, cadastro, top=1, minimo_de_cotistas=100, classe=''):  
+      cadastro      = cadastro[cadastro['SIT'] == 'EM FUNCIONAMENTO NORMAL']
+      fundos        = informes[informes['NR_COTST'] >= minimo_de_cotistas]
+      cnpj_informes = fundos['CNPJ_FUNDO'].drop_duplicates()
+      
+      fundos = fundos.pivot(index='DT_COMPTC', columns='CNPJ_FUNDO')  
+      cotas_normalizadas = fundos['VL_QUOTA'] / fundos['VL_QUOTA'].iloc[0] -1
+      
+      if classe == 'multimercado':
+        cnpj_cadastro      = cadastro[cadastro['CLASSE'] == 'Fundo Multimercado']['CNPJ_FUNDO']   
+        cotas_normalizadas = cotas_normalizadas[cnpj_cadastro[cnpj_cadastro.isin(cnpj_informes)]]
+    
+      if classe == 'acoes':
+        cnpj_cadastro      = cadastro[cadastro['CLASSE'] == 'Fundo de Ações']['CNPJ_FUNDO']   
+        cotas_normalizadas = cotas_normalizadas[cnpj_cadastro[cnpj_cadastro.isin(cnpj_informes)]]
+    
+      if classe == 'rendafixa':
+        cnpj_cadastro      = cadastro[cadastro['CLASSE'] == 'Fundo de Renda Fixa']['CNPJ_FUNDO']   
+        cotas_normalizadas = cotas_normalizadas[cnpj_cadastro[cnpj_cadastro.isin(cnpj_informes)]]
+    
+    
+      #melhores
+      melhores = pd.DataFrame()
+      melhores['retorno(%)'] = (cotas_normalizadas.iloc[-1].sort_values(ascending=False)[:top] - 1) * 100
+      for cnpj in melhores.index:
+        fundo = cadastro[cadastro['CNPJ_FUNDO'] == cnpj]
+        melhores.at[cnpj, 'Fundo de Investimento'] = fundo['DENOM_SOCIAL'].values[0]
+        melhores.at[cnpj, 'Classe']                = fundo['CLASSE'].values[0]
+        melhores.at[cnpj, 'PL']                    = fundo['VL_PATRIM_LIQ'].values[0]
+        melhores.at[cnpj, 'PL2']                   = fundo['VL_PATRIM_LIQ'].shift(1).values[0]
+        melhores.at[cnpj, 'Variação']              = fundo['VL_PATRIM_LIQ'].shift(1).values[0]/fundo['VL_PATRIM_LIQ'].values[0]-1
+      #piores
+      piores = pd.DataFrame()
+      piores['retorno(%)'] = (cotas_normalizadas.iloc[-1].sort_values(ascending=True)[:top] - 1) * 100
+      for cnpj in piores.index:
+        fundo = cadastro[cadastro['CNPJ_FUNDO'] == cnpj]
+        piores.at[cnpj, 'Fundo de Investimento'] = fundo['DENOM_SOCIAL'].values[0]
+        piores.at[cnpj, 'Classe']                = fundo['CLASSE'].values[0]
+        piores.at[cnpj, 'PL']                    = fundo['VL_PATRIM_LIQ'].values[0]
+      
+      return melhores, piores    
+        
+    def consulta_fundo(informes, cnpj):  
+      fundo = informes[informes['CNPJ_FUNDO'] == cnpj].copy()
+      fundo.set_index('DT_COMPTC', inplace=True)
+      fundo['cotas_normalizadas'] = (fundo['VL_QUOTA'] / fundo['VL_QUOTA'].iloc[0])*100-100
+      return fundo
+
+    #********************************************ANALISE DOS FUNDOS DE INVESTIMENTO*************************************
+    primeira_leitura = '2/6/2021 17:00:00'
+    ultima_leitura = datetime.strptime(primeira_leitura, '%d/%m/%Y %H:%M:%S')
+    data_atual = (datetime.now()).strftime("%d/%m/%Y %H:%M:%S")
+    leitura_atual = datetime.strptime(data_atual, '%d/%m/%Y %H:%M:%S')
+while (leitura_atual - ultima_leitura ).days >= 1:    
+    data_atual = (datetime.now()).strftime("%d/%m/%Y %H:%M:%S")
+    ultima_leitura = datetime.strptime(data_atual, '%d/%m/%Y %H:%M:%S')
+    data_atual = (datetime.now())
+    data_inicial = ano(corrige_mes)
+    data_inicial,data_final   
+    cdi = (cdi_acumulado('2021-01-01', '2021-06-01') *100)-100
+    retorno_cdi=cdi.iloc[-1]
+    ibov = yf.download('^BVSP', start='2021-01-01', end='2021-06-01')['Adj Close']
+    retorno_ibov = (ibov.iloc[-1]/ibov.iloc[0]*100)-100
+    cadastro = busca_cadastro_cvm()
+    informes = busca_informes_diarios_cvm_por_periodo(data_inicio= data_inicial, data_fim= data_final)
+    melhores,piores = melhores_e_piores(informes, cadastro, top=3, minimo_de_cotistas=300, classe='acoes')
+    indicacao_acao = melhores.groupby(['Fundo de Investimento'])['Classe'].count().reset_index()
+    melhores,piores = melhores_e_piores(informes, cadastro, top=3, minimo_de_cotistas=300, classe='multimercado')
+    indicacao_multimercado = melhores.groupby(['Fundo de Investimento'])['Classe'].count().reset_index()
+    melhores,piores = melhores_e_piores(informes, cadastro, top=3, minimo_de_cotistas=300, classe='rendafixa')
+    indicacao_rendafixa = melhores.groupby(['Fundo de Investimento'])['Classe'].count().reset_index()
+    fundo_acao = list(indicacao_acao['Fundo de Investimento'])
+    fundo_mmer = list(indicacao_multimercado['Fundo de Investimento'])
+    fundo_rfix = list(indicacao_rendafixa['Fundo de Investimento'])    
+    #**************************** LEITURA GOOGLE SHEETS *******************************
+    # define o escopo
+    escopo  = [ 'https://spreadsheets.google.com/feeds' , 'https://www.googleapis.com/auth/drive' ]
+    # adicionar credenciais à conta
+    creds  = ServiceAccountCredentials.from_json_keyfile_name('C:/Users/55119/.spyder-py3/projeto-tcc-315317-90a95a8e86cc.json',escopo)
+    # autorizar a planilha 
+    client = gspread.authorize(creds)
+    # seleciona planilha
+    sheet = client.open('Respostas - Análise de Perfil ')
+    sheet_instance = sheet.get_worksheet(0)
+    records_data = sheet_instance.get_all_records()
+    records_df = pd.DataFrame.from_dict(records_data
+    #renomeia perguntas do google forms
+    novoindex = records_df.rename(columns={'Carimbo de data/hora':'TIME',
+           'Como você gostaria de ser chamado?':'NOME',                                   
+           'Ao procurar por um investimento, o que você busca?':'OBJETIVO',
+           'Como você avalia seu nível de conhecimento sobre investimentos?':'CONHECIMENTO',
+           'Se algo inesperado acontecer na economia ou no mercado e o resultado for uma oscilação grande nos seus investimentos, qual a sua atitude?':'INSTABILIDADE',
+           'Por quanto tempo você pretende deixar seu dinheiro investido?':'PERIODO',
+           'Para receber nossa sugestão informe seu melhor email.':'EMAIL',
+           'Quais desses investimentos você já realizou no passado?':'INVESTIMENTO',
+           'Juliana ganhou 10 mil reais e aplicou todo seu dinheiro na poupança. Como você avalia a decisão de Juliana?':'CASO 1',
+           'Matheus não possui reserva de emergência e investe todo seu patrimônio em bolsa de valores. Como você avalia a decisão de Matheus?':'CASO 2',
+           'Como você investiria no mercado de ações?': 'AÇÕES'}, inplace = False)    
+    #Data
+    #data_atual = (datetime.now()).strftime("%d/%m/%Y %H:%M:%S")
+    #leitura_atual_forms = datetime.strptime(data_atual, '%d/%m/%Y %H:%M:%S')   
+    #compara_tempo_forms = novoindex['TIME'].iloc[-1] 
+    #primeira_leitura_forms = datetime.strptime(compara_tempo, '%d/%m/%Y %H:%M:%S')
+   
+    #Looping comparando data da ultima resposta.   
+    while (leitura_atual_forms != primeira_leitura_forms ):
+        sheet = client.open('Respostas - Análise de Perfil ')
+        sheet_instance = sheet.get_worksheet(0)
+        records_data = sheet_instance.get_all_records()
+        records_df = pd.DataFrame.from_dict(records_data)    
+        novoindex = records_df.rename(columns={'Carimbo de data/hora':'TIME',
+           'Como você gostaria de ser chamado?':'NOME',                                   
+           'Ao procurar por um investimento, o que você busca?':'OBJETIVO',
+           'Como você avalia seu nível de conhecimento sobre investimentos?':'CONHECIMENTO',
+           'Se algo inesperado acontecer na economia ou no mercado e o resultado for uma oscilação grande nos seus investimentos, qual a sua atitude?':'INSTABILIDADE',
+           'Por quanto tempo você pretende deixar seu dinheiro investido?':'PERIODO',
+           'Para receber nossa sugestão informe seu melhor email.':'EMAIL',
+           'Quais desses investimentos você já realizou no passado?':'INVESTIMENTO',
+           'Juliana ganhou 10 mil reais e aplicou todo seu dinheiro na poupança. Como você avalia a decisão de Juliana?':'CASO1',
+           'Matheus não possui reserva de emergência e investe todo seu patrimônio em bolsa de valores. Como você avalia a decisão de Matheus?':'CASO2',
+           'Como você investiria no mercado de ações?': 'AÇÕES'}, inplace = False)
+     # FUNÇÕES ATRIBUEM PESOS PARA RESPOSTAS
+        def OBJETIVO(valor):
+            if valor == 'Rentabilidade': perfil = 10#'agressivo'                           
+            elif valor == 'Segurança': perfil = 1#'conservador'
+            else: perfil = 5#'moderado'   
+            return perfil
+        
+        def CONHECIMENTO(valor):
+            if valor == 'Alto': perfil1 = 10#'agressivo'
+            elif valor == 'Baixo': perfil1 = 1#'conservador'
+            else: perfil1 = 5#'moderado'   
+            return perfil1
+        def INSTABILIDADE(valor):
+            if valor == 'Entendo que meu patrimônio está sujeito a flutuações dessa magnitude e não está 100% protegido': abc = 10#'agressivo'
+            elif valor == 'Resgataria minhas aplicações': abc = 1#'conservador'
+            else: abc = 5#'moderado'   
+            return abc
+        
+        def PERIODO(valor):
+            if valor == 'mais de 5 anos': perfil3 = 10#'agressivo'
+            elif valor == '1 ano': perfil3 = 1#'conservador'
+            elif valor == '6 meses': perfil3 = 1#'conservador'
+            else: perfil3 = 5#'moderado'   
+            return perfil3
+        
+        def INVESTIMENTO(valor):
+            if valor == 'Nunca Investi': perfil3 = 1#'agressivo'
+            elif valor == 'Bolsa de Valores e Derivativos': perfil3 = 10#'conservador'
+            elif valor == 'Fundos de Investimento': perfil3 = 5#'conservador'
+            elif valor == 'Poupança': perfil3 = 1#'conservador'
+            elif valor == 'Previdência Privada': perfil3 = 5#'conservador'
+            else: perfil3 = 1#'moderado'   
+            return perfil3
+        
+        def CASO1(valor):
+            if valor == 'Discordo totalmente': perfil3 = 10#'agressivo'
+            elif valor == 'Concordo plenamente': perfil3 = 1#'conservador'
+            else: perfil3 = 5#'moderado'   
+            return perfil3
+        
+        def CASO2(valor):
+            if valor == 'Discordo totalmente': perfil3 = 1#'agressivo'
+            elif valor == 'Concordo plenamente': perfil3 = 10#'conservador'
+            else: perfil3 = 5#'moderado'   
+            return perfil3
+      
+        def ACOES(valor):
+            if valor == 'Investiria em empresas com grande potencial de crescimento': perfil3 = 10#'agressivo'
+            elif valor == 'Investiria somente em empresas consolidadas': perfil3 = 1#'conservador'
+            else: perfil3 = 5#'moderado'   
+            return perfil3
+        
+        #PONTUAÇÃO MÉDIA DO USUARIO
+        nome = (novoindex['NOME'].iloc[-1])
+        perg_1 = OBJETIVO(novoindex['OBJETIVO'].iloc[-1])
+        perg_2 = CONHECIMENTO(novoindex['CONHECIMENTO'].iloc[-1])
+        perg_3 = INSTABILIDADE(novoindex['INSTABILIDADE'].iloc[-1])
+        perg_4 = INVESTIMENTO(novoindex['INVESTIMENTO'].iloc[-1])
+        perg_5 = CASO1(novoindex['CASO1'].iloc[-1])
+        perg_6 = CASO2(novoindex['CASO2'].iloc[-1])
+        perg_7 = ACOES(novoindex['AÇÕES'].iloc[-1])
+        perg_8 = PERIODO(novoindex['PERIODO'].iloc[-1])        
+        final = float((perg_1+perg_2+perg_3+perg_4+perg_5+perg_6+perg_7+perg_8)/8)
+        final
+        #DEFINIÇÃO DE NÍVEIS DE PERFIS
+        conservador = 3.33 
+        moderado = 6.66 
+        agressivo = 10
+        #DEFINE PERFIL INVESTIDOR
+        def PERFIL(valor):            
+            if valor <= conservador: perfil_investidor ='conservador'
+            elif valor <= moderado: perfil_investidor = 'moderado'
+            elif valor <= agressivo:  perfil_investidor = 'agressivo'
+            else: perfil_investidor = 'não encontrado'
+            return perfil_investidor            
+        investidor = PERFIL(final)
+        #DEFINE A CLASSE DO FUNDO
+        def CLASSE(valor):
+            if valor == 'conservador' : classe = 'Fundos de Renda Fixa'    
+            elif valor == 'moderado' : classe = 'Fundos Multimercado'
+            else: classe = 'Fundos de Ações'
+            return classe
+        classe_fundo = CLASSE(investidor)
+        #DEFINE OS FUNDOS QUE SERÃO RECOMENDADOS
+        def REC_FUNDO(valor):
+            if valor == 'conservador' : recomendacao = list(indicacao_rendafixa['Fundo de Investimento'])       
+            elif valor == 'moderado' : recomendacao = list(indicacao_multimercado['Fundo de Investimento'])
+            else: recomendacao = list(indicacao_acao['Fundo de Investimento'])
+            return recomendacao
+        rec_final = REC_FUNDO(investidor)
+        #RECOMENDAÇÃO FINAL AJUSTADA PARA STRING
+        recomendacao_final = ', '.join(rec_final)
+        #ARMAZENA EMAIL QUE RECEBERÁ A RECOMENDAÇÃO
+        enviaremail = novoindex['EMAIL'].iloc[-1]
+        #SUGESTÕES DAS CLASSES DOS FUNDOS
+        opcao1_rf=indicacao_rendafixa['Fundo de Investimento'].iloc[0]
+        opcao2_rf=indicacao_rendafixa['Fundo de Investimento'].iloc[1]
+        opcao3_rf=indicacao_rendafixa['Fundo de Investimento'].iloc[2]
+        opcao1_mm=indicacao_multimercado['Fundo de Investimento'].iloc[0]
+        opcao2_mm=indicacao_multimercado['Fundo de Investimento'].iloc[1]
+        opcao3_mm=indicacao_multimercado['Fundo de Investimento'].iloc[2]
+        opcao1_ac=indicacao_acao['Fundo de Investimento'].iloc[0]
+        opcao2_ac=indicacao_acao['Fundo de Investimento'].iloc[1]
+        opcao3_ac=indicacao_acao['Fundo de Investimento'].iloc[2]
+        rec_rf = f'Sugestão 1: {opcao1_rf}\n\nSugestão 2: {opcao2_rf}\n\nSugestão 3: {opcao3_rf}'
+        rec_mm = f'Sugestão 1: {opcao1_mm}\n\nSugestão 2: {opcao2_mm}\n\nSugestão 3: {opcao3_mm}'
+        rec_ac = f'Sugestão 1: {opcao1_ac}\n\nSugestão 2: {opcao2_ac}\n\nSugestão 3: {opcao3_ac}'
+        #AJUSTA FORMATO DOS FUNDOS PARA ENVIO DA RECOMENDAÇÃO
+        def REC_FINAL_FUNDO(valor):
+            if valor == 'conservador' : recomendacao = rec_rf       
+            elif valor == 'moderado' : recomendacao = rec_mm
+            else: recomendacao = rec_ac
+            return recomendacao
+        recomedacao_final_separada = REC_FINAL_FUNDO(investidor)
+
+        # conexão com os servidores do google
+        smtp_ssl_host = 'smtp.gmail.com'
+        smtp_ssl_port = 465
+        # username ou email para logar no servidor
+        username = 'encontreseufi@gmail.com'
+        password = '************'
+        #ATRIBUI NOMES AS VARIAVÉIS E FORMATA CORPO DE EMAIL
+        perfil_final_investidor = ''.join(investidor)
+        from_addr = 'encontreseufi@gmail.com'
+        to_addrs = [''.join(enviaremail)]
+        mensagem0 = f'Olá {nome},\n'
+        mensagem1 = f'\nApós analisarmos as suas respostas do questionário, identificamos que o seu perfil de investidor é {perfil_final_investidor}.\n\nBaseado nisso a classe que mais se adequa ao seu perfil é a de {classe_fundo}.\n\nEntão escolhemos para você os três melhores fundos de investimentos para o seu perfil, que apresentaram a maior rentabilidade nos últimos seis meses. São eles:\n\n'
+        mensagem2 = f'\n\nPor favor, nos ajude a melhorar respondendo um rápido questionário de feedback!\nVocê será redirecionado para o questionário clicando no link a seguir: https://forms.gle/t6ppVszZmW1hg92N9 \n\nEmail: encontreseufi@gmail.com | Site: https://sites.google.com/view/encontreseufi\nAtenciosamente,\nPaulo Henrique Barros de Moura'
+        mensagemfinal= mensagem0+mensagem1+recomedacao_final_separada+mensagem2
+        mensagemfinal
+        message = MIMEText(''.join(mensagemfinal))
+        message['subject'] = 'Sugestão de Fundo de Investimento'
+        message['from'] = from_addr
+        message['to'] = ', '.join(to_addrs)        
+        # conectaremos de forma segura usando SSL
+        server = smtplib.SMTP_SSL(smtp_ssl_host, smtp_ssl_port)
+        # para interagir com um servidor externo precisaremos
+        # fazer login nele
+        server.login(username, password)
+        server.sendmail(from_addr, to_addrs, message.as_string())
+        server.quit()
+        #ATUALIZA HORARIO DAS VARIÁVEIS UTILIZADAS NO COMANDO WHILE
+        compara_novo_tempo_forms = novoindex['TIME'].iloc[-1] 
+        leitura_atual_forms = datetime.strptime(compara_novo_tempo_forms, '%d/%m/%Y %H:%M:%S')
+        primeira_leitura_forms = datetime.strptime(compara_novo_tempo_forms, '%d/%m/%Y %H:%M:%S')
+        while (leitura_atual_forms == primeira_leitura_forms):
+            time.sleep(99) #API GOOGLE PERMITE 1 CONSULTA A CADA 99S
+        #REPETE CÓDIGO ANTERIOR PARA A CONDIÇÃO ESTABELECIDA NO WHILE
+            sheet = client.open('Respostas - Análise de Perfil ')
+            sheet_instance = sheet.get_worksheet(0)
+            records_data = sheet_instance.get_all_records()
+            records_df = pd.DataFrame.from_dict(records_data)    
+            novoindex = records_df.rename(columns={'Carimbo de data/hora':'TIME',
+           'Como você gostaria de ser chamado?':'NOME',                                   
+           'Ao procurar por um investimento, o que você busca?':'OBJETIVO',
+           'Como você avalia seu nível de conhecimento sobre investimentos?':'CONHECIMENTO',
+           'Se algo inesperado acontecer na economia ou no mercado e o resultado for uma oscilação grande nos seus investimentos, qual a sua atitude?':'INSTABILIDADE',
+           'Por quanto tempo você pretende deixar seu dinheiro investido?':'PERIODO',
+           'Para receber nossa sugestão informe seu melhor email.':'EMAIL',
+           'Quais desses investimentos você já realizou no passado?':'INVESTIMENTO',
+           'Juliana ganhou 10 mil reais e aplicou todo seu dinheiro na poupança. Como você avalia a decisão de Juliana?':'CASO 1',
+           'Matheus não possui reserva de emergência e investe todo seu patrimônio em bolsa de valores. Como você avalia a decisão de Matheus?':'CASO 2',
+           'Como você investiria no mercado de ações?': 'AÇÕES'}, inplace = False)
+            compara_novo_tempo_forms = novoindex['TIME'].iloc[-1] 
+            leitura_atual_forms = datetime.strptime(compara_novo_tempo_forms, '%d/%m/%Y %H:%M:%S')
+    while (leitura_atual - ultima_leitura ).days < 1:
+    #ATUALIZA HORARIO DAS VARIÁVEIS UTILIZADAS NO COMANDO WHILE
+        data_atual = (datetime.now()).strftime("%d/%m/%Y %H:%M:%S")
+        leitura_atual = datetime.strptime(data_atual, '%d/%m/%Y %H:%M:%S')
+        
+    
+        
